@@ -1,0 +1,6 @@
+{
+  "name": "VenXR AI Chat Assistant",
+  "description": "An AI chat assistant handling long conversations, multi-file inputs, and file generation with LangGraph, Django, and React-Redux Toolkit.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

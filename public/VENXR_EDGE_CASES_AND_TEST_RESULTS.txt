@@ -1,0 +1,452 @@
+================================================================================
+              VENXR AI CHAT ASSISTANT: COMPREHENSIVE QA EDGE CASES
+                           & SYSTEM TEST SPECIFICATION
+================================================================================
+Document Version : 1.0.0
+Author           : VenXR Engineering Team / Systems Architecture
+Stack            : LangGraph · Django ASGI · React 19 (Redux Toolkit) · PostgreSQL
+Specification    : Based on VenXR Take-Home Assignment Requirements
+================================================================================
+
+TABLE OF CONTENTS:
+1. EXECUTIVE SUMMARY & TEST METHODOLOGY
+2. SECTION 01: LONG-RUNNING CHAT & MEMORY STRATEGY (TC-MEM-01 to TC-MEM-05)
+3. SECTION 02: ANY FILE IN (INGESTION & SECURITY BOUNDARIES) (TC-FIN-01 to TC-FIN-08)
+4. SECTION 03: ANY FILE OUT (GENERATION & REVISION PIPELINE) (TC-FOUT-01 to TC-FOUT-04)
+5. SECTION 04: AGENT (LANGGRAPH) ROUTING & RELIABILITY (TC-AGT-01 to TC-AGT-04)
+6. SECTION 05: BACKEND & NETWORK RESILIENCE (TC-NET-01 to TC-NET-04)
+7. VERIFICATION MATRIX & PASS/FAIL CRITERIA
+
+================================================================================
+1. EXECUTIVE SUMMARY & TEST METHODOLOGY
+================================================================================
+The VenXR assignment requires an AI assistant that handles long conversations
+and any file in, any file out, backed by a LangGraph agent, Django backend, and
+React frontend.
+
+This document details all critical edge cases, failure modes, inputs, expected
+outcomes, and actual architectural mitigations implemented in the codebase.
+
+Severity Classifications:
+- [CRITICAL] : System crashes, data corruption, security vulnerability, or infinite loop.
+- [HIGH]     : Broken user flow, silent failure, loss of thread context, or unhandled rejection.
+- [MEDIUM]   : UI display glitch, non-optimal recovery, or minor formatting defect.
+
+================================================================================
+2. SECTION 01: LONG-RUNNING CHAT & MEMORY STRATEGY
+================================================================================
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-MEM-01
+TITLE        : Conversation History Exceeding Model Context Window (100+ Turns)
+SEVERITY     : [CRITICAL]
+REQUIREMENT  : Long-running chat (threads stay coherent across hundreds of messages)
+PRE-CONDITIONS: Active thread with 120 previous message turns.
+INPUT        : User sends: "Based on our discussion in turn 12 about infrastructure costs, what was the projected Q3 saving?"
+EXECUTION    :
+  1. Frontend dispatches sendMessageThunk.
+  2. Backend loads conversation history from PostgreSQL.
+  3. Memory manager evaluates context token count.
+EXPECTED BEHAVIOR:
+  - System must NOT crash with HTTP 400 ContextWindowExceeded.
+  - Hybrid Memory Strategy engages:
+    * Last 10 turns are kept verbatim (sliding window).
+    * Turns 1-110 are summarized into a compressed executive memory node.
+  - The model accurately retrieves the specific cost saving figure from the summary.
+FAILURE MODE (WHAT BREAKS IF UNMITIGATED):
+  - Naive transcript concatenation exceeds the LLM context limit, causing a 400 error.
+  - Pure RAG vector search misses conversational chronology.
+CODE LOCATION: backend/agent/graph.py (AgentState memory sliding window) & DECISIONS.md
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-MEM-02
+TITLE        : Thread Persistence and Resume After Browser Hard Refresh / Crash
+SEVERITY     : [HIGH]
+REQUIREMENT  : Threads persist and resume after refresh or restart
+PRE-CONDITIONS: User was mid-conversation with 15 messages and 2 uploaded files.
+INPUT        : User triggers browser hard refresh (Ctrl+F5) or restarts local server.
+EXECUTION    :
+  1. User reloads http://localhost:3000.
+  2. React initializes Redux store.
+  3. Sidebar fetches historical threads from backend.
+EXPECTED BEHAVIOR:
+  - All historical messages rehydrate cleanly with timestamps and attachments.
+  - Generated files remain downloadable.
+  - Active thread ID restores to the last active session.
+  - LangGraph checkpointer (PostgresSaver) maintains turn state.
+FAILURE MODE:
+  - State lost if stored solely in ephemeral component memory (useState) or localStorage.
+CODE LOCATION: src/store/chatSlice.ts & backend/chat/models.py (Thread, Message models)
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-MEM-03
+TITLE        : Rapid Double-Submission / Concurrent Message Race Condition
+SEVERITY     : [HIGH]
+REQUIREMENT  : Responses stream token by token; user can stop and regenerate
+PRE-CONDITIONS: Network latency is 500ms.
+INPUT        : User rapidly double-clicks the Send button or presses Enter twice in 50ms.
+EXECUTION    :
+  1. First dispatch enters sendMessageThunk.pending.
+  2. Second dispatch attempt arrives before stream finishes.
+EXPECTED BEHAVIOR:
+  - Frontend input textarea and send button immediately disable when isStreaming=true.
+  - Second submission is ignored or queued cleanly.
+  - No duplicate assistant placeholder bubbles or interleaved SSE streams are created.
+FAILURE MODE:
+  - Interleaved stream tokens overwrite state; Redux appendStreamChunk causes corrupted text.
+CODE LOCATION: src/components/ChatInput.tsx (disabled={isStreaming})
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-MEM-04
+TITLE        : User Aborts Mid-Stream ("Stop Generation") & True Upstream Cancellation
+SEVERITY     : [CRITICAL]
+REQUIREMENT  : User can stop generation
+PRE-CONDITIONS: Assistant has generated 25 tokens of a 500-token response.
+INPUT        : User clicks the "Stop Generation" button.
+EXECUTION    :
+  1. React dispatches cancelStreaming({ threadId }).
+  2. AbortController.abort() terminates the client fetch connection.
+  3. Django ASGI server catches connection drop.
+EXPECTED BEHAVIOR:
+  - Frontend immediately freezes assistant message at current token count.
+  - Assistant status updates from 'streaming' to 'complete'.
+  - Backend ASGI generator catches asyncio.CancelledError and halts upstream LLM call immediately.
+  - No orphaned background token generation billing occurs.
+FAILURE MODE:
+  - UI hides stream, but server continues generating 500 tokens in the background, wasting cost.
+CODE LOCATION: src/store/chatSlice.ts (activeAbortControllers) & backend/chat/views.py
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-MEM-05
+TITLE        : Regenerate Response on Failed or Completed Turn
+SEVERITY     : [MEDIUM]
+REQUIREMENT  : User can regenerate responses
+PRE-CONDITIONS: Last assistant message finished or failed.
+INPUT        : User clicks "Retry" or "Regenerate".
+EXECUTION    :
+  1. Dispatches regenerateMessageThunk(threadId).
+  2. Finds last user prompt and re-invokes stream.
+EXPECTED BEHAVIOR:
+  - Re-runs LangGraph pipeline using full thread context.
+  - Overwrites or updates the assistant turn cleanly without duplicating the user prompt.
+CODE LOCATION: src/store/chatSlice.ts (regenerateMessageThunk)
+
+================================================================================
+3. SECTION 02: ANY FILE IN (INGESTION & SECURITY BOUNDARIES)
+================================================================================
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-FIN-01
+TITLE        : File Type Extension Spoofing (Malicious Binary Disguised as PDF)
+SEVERITY     : [CRITICAL - SECURITY]
+REQUIREMENT  : Unsupported types fail gracefully; security of uploads
+PRE-CONDITIONS: Upload interface is open.
+INPUT        : Uploading an ELF/EXE binary renamed to "invoice_q3.pdf".
+EXECUTION    :
+  1. File dropped into ChatInput.
+  2. Client-side and server-side validators inspect the file.
+EXPECTED BEHAVIOR:
+  - Magic byte sniffing rejects the upload: initial bytes are not "%PDF".
+  - Validation error displayed: "File content does not match expected signature for .pdf".
+  - File is NOT passed to LangGraph file_parser_node.
+FAILURE MODE:
+  - System blindly trusts file.name.endswith(".pdf"), crashing PDF text extraction libraries.
+CODE LOCATION: backend/security/file_validator.py (MAGIC_SIGNATURES inspection)
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-FIN-02
+TITLE        : Zero-Byte Empty File Upload
+SEVERITY     : [MEDIUM]
+REQUIREMENT  : Any file in; graceful handling
+PRE-CONDITIONS: Normal chat input.
+INPUT        : Uploading an empty file: "empty_log.txt" (0 bytes).
+EXECUTION    :
+  1. User selects 0-byte file and sends prompt.
+EXPECTED BEHAVIOR:
+  - Validation catches size === 0.
+  - Surfaces clean inline warning: "Attached file empty_log.txt is empty."
+  - Assistant answers the text prompt without throwing an unhandled exception.
+CODE LOCATION: src/services/api.ts & backend/security/file_validator.py
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-FIN-03
+TITLE        : File Exceeding 25MB Threshold
+SEVERITY     : [HIGH]
+REQUIREMENT  : Size and type limits
+INPUT        : User attempts to upload a 35MB high-resolution scan "blueprints.pdf".
+EXECUTION    :
+  1. Drag and drop file onto input bar.
+EXPECTED BEHAVIOR:
+  - Upload rejected immediately at the client boundary before wasting bandwidth.
+  - Chip marked in red with message: "File exceeds maximum 25MB limit".
+  - Backend enforces the same 25MB cap in case client validation was bypassed.
+CODE LOCATION: src/services/api.ts (MAX_FILE_SIZE = 25MB)
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-FIN-04
+TITLE        : Corrupted or Password-Protected PDF
+SEVERITY     : [HIGH]
+REQUIREMENT  : The assistant must actually use file contents; unsupported types fail gracefully
+INPUT        : Uploading an encrypted / DRM-locked financial PDF.
+EXECUTION    :
+  1. File sent to file_parser_node.
+  2. PyPDF / pdfplumber attempts decryption.
+EXPECTED BEHAVIOR:
+  - Parser catches encryption error.
+  - Does NOT crash the LangGraph agent.
+  - Assistant responds: "The PDF 'document.pdf' is password-protected or unreadable. Please provide an unlocked copy."
+CODE LOCATION: backend/agent/graph.py (file_parser_node try/except)
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-FIN-05
+TITLE        : Nested ZIP Bomb Attack
+SEVERITY     : [CRITICAL - SECURITY]
+REQUIREMENT  : ZIP at minimum; security of uploads
+INPUT        : Uploading a 500KB ZIP file containing 10,000 files expanding to 50GB ("zip bomb").
+EXECUTION    :
+  1. Archive received by file_validator.py.
+  2. Inspects ZipInfo headers before extracting to disk.
+EXPECTED BEHAVIOR:
+  - Validates total uncompressed size <= 100MB and total file count <= 200 files.
+  - Detects threshold violation and rejects archive without expanding.
+  - Error: "ZIP uncompressed payload exceeds safety limit of 100MB."
+CODE LOCATION: backend/security/file_validator.py (validate_zip_archive)
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-FIN-06
+TITLE        : Path Traversal Attack Inside ZIP Archive (Directory Traversal)
+SEVERITY     : [CRITICAL - SECURITY]
+REQUIREMENT  : Security of uploads
+INPUT        : ZIP archive containing an entry with path: "../../etc/shadow" or "/var/www/index.html".
+EXECUTION    :
+  1. Archive inspected during decompression.
+EXPECTED BEHAVIOR:
+  - Validator checks info.filename for ".." and leading slashes.
+  - Path traversal attempt detected and blocked immediately.
+  - Filename sanitized with os.path.basename before any disk write.
+CODE LOCATION: backend/security/file_validator.py (path traversal check)
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-FIN-07
+TITLE        : Multi-File Mixed Batch Upload (PDF + XLSX + PNG + ZIP)
+SEVERITY     : [HIGH]
+REQUIREMENT  : Upload one or many files in a message: PDF, DOCX, XLSX/CSV, PPTX, images, code, JSON, ZIP
+INPUT        : User attaches 4 files simultaneously with prompt: "Cross-reference the spreadsheet with the PDF summary."
+EXECUTION    :
+  1. ChatInput renders 4 distinct file chips with format badges and sizes.
+  2. file_parser_node processes each file sequentially or in parallel.
+EXPECTED BEHAVIOR:
+  - All 4 attachments indexed in AgentState["attachments"].
+  - Model cross-references data from the sheet and PDF in a single coherent answer.
+CODE LOCATION: src/components/ChatInput.tsx & backend/agent/graph.py
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-FIN-08
+TITLE        : Unsupported Exotic File Type (.xyz, .bin)
+SEVERITY     : [MEDIUM]
+REQUIREMENT  : Unsupported types fail gracefully
+INPUT        : User uploads "firmware.bin".
+EXECUTION    :
+  1. File dropped into chat.
+EXPECTED BEHAVIOR:
+  - Categorized as parseStatus='unsupported'.
+  - UI surfaces an amber/red chip explaining format is unsupported.
+  - User can remove the chip or send prompt; agent clarifies it cannot parse binary firmware.
+CODE LOCATION: src/services/api.ts (categorizeFile)
+
+================================================================================
+4. SECTION 03: ANY FILE OUT (GENERATION & REVISION PIPELINE)
+================================================================================
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-FOUT-01
+TITLE        : Generation of Real Downloadable Files (CSV, DOCX, Code)
+SEVERITY     : [HIGH]
+REQUIREMENT  : Assistant creates real files on request; files appear as downloadable cards
+INPUT        : User: "Create a CSV of our 2026 projected revenues by department."
+EXECUTION    :
+  1. LangGraph agent_node identifies file generation intent.
+  2. Routes to file_generator_node.
+  3. Emits event: file with GeneratedFile metadata.
+EXPECTED BEHAVIOR:
+  - Chat renders a dedicated downloadable card with:
+    * Filename: "Executive_Financial_Projections_2026.csv"
+    * File type badge: CSV · 2.4 KB
+    * Preview snippet of first rows
+    * Working "Download" button triggering browser blob/file download
+CODE LOCATION: src/components/ChatMessageItem.tsx & backend/agent/graph.py
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-FOUT-02
+TITLE        : Multi-Turn Revision Loop ("Add a column", "Make it shorter")
+SEVERITY     : [HIGH]
+REQUIREMENT  : Files can be revised ("add a column", "make it shorter")
+PRE-CONDITIONS: Assistant just generated a 4-column CSV in turn 1.
+INPUT        : User: "Add an EBITDA Margin column and remove the Q1 row."
+EXECUTION    :
+  1. LangGraph agent re-loads previously generated file metadata from state.
+  2. Applies targeted column addition and row subtraction.
+  3. Re-routes through file_generator_node.
+EXPECTED BEHAVIOR:
+  - Assistant acknowledges previous file and presents updated revised file card.
+  - Previous file remains accessible; new file reflects revisions accurately.
+CODE LOCATION: backend/agent/graph.py (AgentState["generated_files"])
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-FOUT-03
+TITLE        : Cross-Format Conversion (CSV to Formatted DOCX / Markdown)
+SEVERITY     : [MEDIUM]
+REQUIREMENT  : DOCX, PDF, XLSX, CSV, PPTX, PNG chart, Markdown and code files at minimum
+INPUT        : User: "Convert this CSV dataset into a formal Word document summary."
+EXPECTED BEHAVIOR:
+  - Generates a .docx artifact with styled headings, executive summary, and formatted table.
+  - Downloadable card updates with DOCX icon and MIME type "application/vnd.openxmlformats...".
+CODE LOCATION: backend/agent/graph.py (file_generator_node)
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-FOUT-04
+TITLE        : Ambiguous File Generation Prompt ("Create a file")
+SEVERITY     : [MEDIUM]
+REQUIREMENT  : Product & UX handling of edge cases
+INPUT        : User: "Please create a file." (No format, no data specified).
+EXPECTED BEHAVIOR:
+  - Agent does NOT crash or hallucinate random binary data.
+  - Agent clarifies: "What kind of file would you like me to generate? (e.g., CSV spreadsheet, DOCX report, Python script, or Markdown document)?"
+CODE LOCATION: backend/agent/graph.py (agent_node decision prompt)
+
+================================================================================
+5. SECTION 04: AGENT (LANGGRAPH) ROUTING & RELIABILITY
+================================================================================
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-AGT-01
+TITLE        : Conditional Routing Bypass for Plain Chat Queries
+SEVERITY     : [HIGH]
+REQUIREMENT  : Graph-based agent with explicit nodes; conditional efficiency
+INPUT        : User: "Hello, what features do you support?" (No files attached).
+EXECUTION    :
+  1. LangGraph evaluates route_inbound conditional edge.
+EXPECTED BEHAVIOR:
+  - START routes DIRECTLY to agent_node -> answer_node -> checkpointer -> END.
+  - file_parser_node is BYPASSED completely.
+  - Zero wasted CPU cycles or parsing latency on simple text queries.
+CODE LOCATION: backend/agent/graph.py (route_inbound edge)
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-AGT-02
+TITLE        : Tool Failure Triggers Bounded Retries (Self-Healing Graph)
+SEVERITY     : [CRITICAL]
+REQUIREMENT  : Tool failures and bad model output are retried or surfaced, never silently dropped
+INPUT        : Mock tool failure (file extraction timeout).
+EXECUTION    :
+  1. file_parser_node throws ToolException.
+  2. Graph conditionally routes to error_retry_node.
+EXPECTED BEHAVIOR:
+  - Graph increments retry_count.
+  - Retries the operation up to 2 times.
+  - If retry succeeds -> proceeds to agent_node.
+  - If retry_count > 2 -> transitions to error_handler and surfaces user-friendly error toast.
+  - NEVER hangs indefinitely or silently drops the turn.
+CODE LOCATION: backend/agent/graph.py (error_retry_node & bounded retries)
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-AGT-03
+TITLE        : Malformed Model JSON Output During Structured Generation
+SEVERITY     : [HIGH]
+REQUIREMENT  : Bad model output retried or surfaced
+INPUT        : Model outputs truncated JSON during file generation.
+EXPECTED BEHAVIOR:
+  - JSON parser catches SyntaxError.
+  - Graph sends repair prompt back to model with specific error feedback.
+  - If repair fails, falls back to plain text explanation with code block.
+CODE LOCATION: backend/agent/graph.py & server.ts
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-AGT-04
+TITLE        : Concurrent Requests in the Same Thread (Checkpointer Isolation)
+SEVERITY     : [HIGH]
+REQUIREMENT  : Use a checkpointer for state
+INPUT        : Two API requests hit thread "thread_123" within 10ms.
+EXPECTED BEHAVIOR:
+  - PostgreSQL transaction isolation prevents dirty writes or checkpointer corruption.
+  - Second request queues until the first checkpointer commit finishes.
+CODE LOCATION: backend/agent/graph.py (PostgresSaver)
+
+================================================================================
+6. SECTION 05: BACKEND & NETWORK RESILIENCE
+================================================================================
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-NET-01
+TITLE        : Upstream API 500 Service Failure & Redux Error Handling
+SEVERITY     : [CRITICAL]
+REQUIREMENT  : Reliability: errors, retries; robust error handling for API service failures
+INPUT        : Upstream Gemini/LLM service returns HTTP 500 or timeout.
+EXECUTION    :
+  1. User toggles "Simulate 500 Failure" in sidebar and sends message.
+  2. sendMessageThunk catches HTTP 500.
+  3. Calls rejectWithValue(errorPayload).
+EXPECTED BEHAVIOR:
+  - Redux store transitions assistant message status to 'failed'.
+  - UI displays high-visibility error card with error code and description.
+  - One-click "Retry" button renders inline, allowing instant recovery without retyping.
+  - Existing chat history remains intact.
+CODE LOCATION: src/store/chatSlice.ts (extraReducers.rejected) & src/components/ChatMessageItem.tsx
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-NET-02
+TITLE        : Rate Limit Throttling (HTTP 429 Too Many Requests)
+SEVERITY     : [HIGH]
+REQUIREMENT  : Basic rate limiting; reliability
+INPUT        : User triggers 20 rapid queries, exhausting rate quota.
+EXPECTED BEHAVIOR:
+  - Server returns HTTP 429 with Retry-After header.
+  - Redux captures error with retryable=true.
+  - UI advises user to wait with a cooldown timer.
+CODE LOCATION: src/services/api.ts & backend/chat/views.py
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-NET-03
+TITLE        : Mid-Stream Network Drop (TCP Socket Interruption)
+SEVERITY     : [HIGH]
+REQUIREMENT  : Reliability: errors, retries
+INPUT        : Network disconnects (WiFi toggled off) while tokens are streaming.
+EXPECTED BEHAVIOR:
+  - Fetch stream throws TypeError ("Failed to fetch").
+  - api.ts catches error and dispatches onError.
+  - Redux marks turn as 'failed' with network error badge.
+  - No infinite spinner; Retry button appears.
+CODE LOCATION: src/services/api.ts (streamChatResponse catch block)
+
+--------------------------------------------------------------------------------
+TEST CASE ID : TC-NET-04
+TITLE        : Mobile Viewport Layout Integrity with Wide Tables and Code Blocks
+SEVERITY     : [MEDIUM]
+REQUIREMENT  : Usable on mobile width
+INPUT        : Viewing a 7-column CSV table and 120-character code block on a 375px mobile screen.
+EXPECTED BEHAVIOR:
+  - Table and code block wrap inside horizontal overflow scroll containers (overflow-x-auto).
+  - Main page layout DOES NOT horizontally stretch or break the 375px viewport boundary.
+  - Mobile slide-out drawer functions smoothly.
+CODE LOCATION: src/components/ChatMessageItem.tsx & src/App.tsx
+
+================================================================================
+7. VERIFICATION MATRIX & PASS/FAIL CRITERIA
+================================================================================
+Test Suite Summary:
+- Total Test Cases Documented : 25
+- Security Boundaries Tested  : 5 (Magic bytes, ZIP bomb, path traversal, 25MB cap, inert code)
+- State Machines Tested       : 4 (Pending, Streaming, Fulfilled, Rejected)
+- LangGraph Routing Paths     : 4 (Inbound conditional, Outbound conditional, Retry, Checkpoint)
+
+How to Run Automated Verification Tests Locally:
+  1. Backend Graph Tests:
+     $ docker compose exec backend pytest backend/tests/test_graph.py
+  2. Security Validation Tests:
+     $ docker compose exec backend pytest backend/tests/test_security.py
+  3. Frontend Type & Build Verification:
+     $ npm run lint
+     $ npm run build
+
+Document End.
+================================================================================
